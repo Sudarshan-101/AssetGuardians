@@ -1,0 +1,145 @@
+version: "3.9"
+
+services:
+  # ─── PostgreSQL ─────────────────────────────────────────────────────────────
+  postgres:
+    image: postgres:15-alpine
+    container_name: dap_postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: password
+      POSTGRES_DB: dap_db
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # ─── Redis ──────────────────────────────────────────────────────────────────
+  redis:
+    image: redis:7-alpine
+    container_name: dap_redis
+    restart: unless-stopped
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # ─── FastAPI Backend ─────────────────────────────────────────────────────────
+  backend:
+    build:
+      context: ./backend      # crawler/ is inside backend/, so it gets copied
+      dockerfile: Dockerfile
+    container_name: dap_backend
+    restart: unless-stopped
+    ports:
+      - "8000:8000"
+    volumes:
+      - ./backend:/app
+      - uploads_data:/app/uploads
+      - faiss_data:/app/faiss_index
+    environment:
+      DATABASE_URL: postgresql+asyncpg://postgres:password@postgres:5432/dap_db
+      DATABASE_URL_SYNC: postgresql://postgres:password@postgres:5432/dap_db
+      REDIS_URL: redis://redis:6379/0
+      CELERY_BROKER_URL: redis://redis:6379/0
+      CELERY_RESULT_BACKEND: redis://redis:6379/0
+      UPLOAD_DIR: /app/uploads
+      FAISS_INDEX_PATH: /app/faiss_index/index
+      SECRET_KEY: ${SECRET_KEY:-changeme-please-use-a-strong-secret}
+      DEBUG: ${DEBUG:-false}
+      DEFAULT_ORG_NAME: ${DEFAULT_ORG_NAME:-My Organization}
+      DEFAULT_ORG_EMAIL: ${DEFAULT_ORG_EMAIL:-admin@assetguard.local}
+      DEFAULT_ORG_PASSWORD: ${DEFAULT_ORG_PASSWORD:-changeme}
+      SENDGRID_API_KEY: ${SENDGRID_API_KEY:-}
+      TWITTER_BEARER_TOKEN: ${TWITTER_BEARER_TOKEN:-}
+      YOUTUBE_API_KEY: ${YOUTUBE_API_KEY:-}
+      GOOGLE_SEARCH_API_KEY: ${GOOGLE_SEARCH_API_KEY:-}
+      GOOGLE_SEARCH_CX: ${GOOGLE_SEARCH_CX:-}
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+  # ─── Celery Worker ───────────────────────────────────────────────────────────
+  celery_worker:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    container_name: dap_celery
+    restart: unless-stopped
+    command: celery -A crawler.tasks worker --loglevel=info --concurrency=2
+    volumes:
+      - ./backend:/app        # crawler/ is at /app/crawler/ — importable
+      - uploads_data:/app/uploads
+      - faiss_data:/app/faiss_index
+    environment:
+      DATABASE_URL_SYNC: postgresql://postgres:password@postgres:5432/dap_db
+      REDIS_URL: redis://redis:6379/0
+      CELERY_BROKER_URL: redis://redis:6379/0
+      CELERY_RESULT_BACKEND: redis://redis:6379/0
+      FAISS_INDEX_PATH: /app/faiss_index/index
+      DEFAULT_ORG_EMAIL: ${DEFAULT_ORG_EMAIL:-admin@assetguard.local}
+      SENDGRID_API_KEY: ${SENDGRID_API_KEY:-}
+      TWITTER_BEARER_TOKEN: ${TWITTER_BEARER_TOKEN:-}
+      YOUTUBE_API_KEY: ${YOUTUBE_API_KEY:-}
+      GOOGLE_SEARCH_API_KEY: ${GOOGLE_SEARCH_API_KEY:-}
+      GOOGLE_SEARCH_CX: ${GOOGLE_SEARCH_CX:-}
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+
+  # ─── Celery Beat (scheduler) ─────────────────────────────────────────────────
+  celery_beat:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    container_name: dap_beat
+    restart: unless-stopped
+    command: celery -A crawler.tasks beat --loglevel=info
+    volumes:
+      - ./backend:/app        # needs crawler.tasks importable
+    environment:
+      CELERY_BROKER_URL: redis://redis:6379/0
+      CELERY_RESULT_BACKEND: redis://redis:6379/0
+    depends_on:
+      - redis
+      - celery_worker
+
+  # ─── React Frontend ──────────────────────────────────────────────────────────
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+      args:
+        VITE_API_URL: /api/v1   # relative path → nginx proxies /api/ → backend
+    container_name: dap_frontend
+    restart: unless-stopped
+    ports:
+      - "3000:80"
+    depends_on:
+      - backend
+
+volumes:
+  postgres_data:
+  redis_data:
+  uploads_data:
+  faiss_data:
